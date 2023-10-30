@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import copy
+import pytz
 from datetime import datetime
 from decimal import Decimal
 from tempfile import mkstemp
@@ -143,8 +144,16 @@ def persist_lines(config, lines) -> None:
                 total_row_count[stream] += 1
 
             # append record
-            if config.get('add_metadata_columns') or config.get('hard_delete'):
-                records_to_load[stream][primary_key_string] = add_metadata_values_to_record(o)
+            if config.get('add_metadata_columns') or config.get('hard_delete') or not config.get('hard_truncate'):
+                prepared_record = add_metadata_values_to_record(o)
+
+                if o.get('record', {}).get('_sdc_deleted_at') is not None:
+                    if primary_key_string in records_to_load[stream]:
+                        previous_record = records_to_load[stream][primary_key_string]
+                        previous_record.update(prepared_record)
+                        prepared_record = previous_record
+
+                records_to_load[stream][primary_key_string] = prepared_record
             else:
                 records_to_load[stream][primary_key_string] = o['record']
 
@@ -210,7 +219,7 @@ def persist_lines(config, lines) -> None:
 
             key_properties[stream] = o['key_properties']
 
-            if config.get('add_metadata_columns') or config.get('hard_delete'):
+            if config.get('add_metadata_columns') or config.get('hard_delete') or not config.get('hard_truncate'):
                 stream_to_sync[stream] = DbSync(config, add_metadata_columns_to_schema(o))
             else:
                 stream_to_sync[stream] = DbSync(config, o)
@@ -222,11 +231,33 @@ def persist_lines(config, lines) -> None:
             total_row_count[stream] = 0
 
         elif t == 'ACTIVATE_VERSION':
-            LOGGER.debug('ACTIVATE_VERSION message')
+            stream = o['stream']
+            version = o['version']
+
+            timestamp = datetime.fromtimestamp(version / 1000.0).astimezone(pytz.UTC).isoformat()
+
+            LOGGER.info('ACTIVATE_VERSION message RECEIVED for stream %s version %s timestamp %s', stream, version, timestamp)
 
             # Initially set flushed state
             if not flushed_state:
                 flushed_state = copy.deepcopy(state)
+
+            filter_streams = [stream]
+
+            if stream not in records_to_load:
+                records_to_load[stream] = {}
+
+            flushed_state = flush_streams(records_to_load,
+                                            row_count,
+                                            stream_to_sync,
+                                            config,
+                                            state,
+                                            flushed_state,
+                                            filter_streams=filter_streams,
+                                            truncated=timestamp)
+
+            # emit last encountered state
+            emit_state(copy.deepcopy(flushed_state))
 
         else:
             raise Exception("Unknown message type {} in message {}"
@@ -250,7 +281,8 @@ def flush_streams(
         config,
         state,
         flushed_state,
-        filter_streams=None):
+        filter_streams=None,
+        truncated=None):
     """
     Flushes all buckets and resets records count to 0 as well as empties records to load list
     :param streams: dictionary with records to load per stream
@@ -260,6 +292,7 @@ def flush_streams(
     :param state: dictionary containing the original state from tap
     :param flushed_state: dictionary containing updated states only when streams got flushed
     :param filter_streams: Keys of streams to flush from the streams dict. Default is every stream
+    :param truncated: timestamp if the table was truncated
     :return: State dict with flushed positions
     """
     parallelism = config.get("parallelism", DEFAULT_PARALLELISM)
@@ -274,6 +307,8 @@ def flush_streams(
         n_streams_to_flush = len(streams.keys())
         if n_streams_to_flush > max_parallelism:
             parallelism = max_parallelism
+        elif n_streams_to_flush == 0:
+            parallelism = 1
         else:
             parallelism = n_streams_to_flush
 
@@ -291,7 +326,9 @@ def flush_streams(
             row_count=row_count,
             db_sync=stream_to_sync[stream],
             delete_rows=config.get('hard_delete'),
-            temp_dir=config.get('temp_dir')
+            temp_dir=config.get('temp_dir'),
+            truncated=truncated,
+            truncate_table=config.get('hard_truncate')
         ) for stream in streams_to_flush)
 
     # reset flushed stream records to empty to avoid flushing same records
@@ -317,7 +354,7 @@ def flush_streams(
 
 
 # pylint: disable=too-many-arguments
-def load_stream_batch(stream, records_to_load, row_count, db_sync, delete_rows=False, temp_dir=None):
+def load_stream_batch(stream, records_to_load, row_count, db_sync, delete_rows=False, temp_dir=None, truncated=None, truncate_table=False):
     """Load a batch of records and do post load operations, like creating
     or deleting rows"""
     # Load into Postgres
@@ -330,6 +367,9 @@ def load_stream_batch(stream, records_to_load, row_count, db_sync, delete_rows=F
     # Delete soft-deleted, flagged rows - where _sdc_deleted at is not null
     if delete_rows:
         db_sync.delete_rows(stream)
+    
+    if truncated is not None:
+        db_sync.truncate_table(stream, truncated_at=truncated, hard_truncate=truncate_table)
 
     # reset row count for the current stream
     row_count[stream] = 0
