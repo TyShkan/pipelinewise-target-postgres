@@ -223,7 +223,9 @@ class DbSync:
         if stream_schema_message is not None:
             # Define initial list of indices to created
             self.hard_delete = self.connection_config.get('hard_delete')
-            if self.hard_delete:
+            self.hard_truncate = self.connection_config.get('hard_truncate')
+
+            if self.hard_delete or not self.hard_truncate:
                 self.indices = ['_sdc_deleted_at']
             else:
                 self.indices = []
@@ -414,7 +416,7 @@ class DbSync:
         return """UPDATE {} SET {} FROM {} s
         WHERE {}
         """.format(table,
-                   ', '.join(['{}=s.{}'.format(c, c) for c in columns]),
+                   ', '.join(['{}=CASE WHEN s."_sdc_deleted_at" IS NOT NULL THEN COALESCE(s.{}, {}.{}) ELSE s.{} END'.format(c, c, table, c, c) for c in columns]),
                    temp_table,
                    self.primary_key_condition(table))
 
@@ -493,6 +495,18 @@ class DbSync:
         query = "DELETE FROM {} WHERE _sdc_deleted_at IS NOT NULL RETURNING _sdc_deleted_at".format(table)
         self.logger.info("Deleting rows from '%s' table... %s", table, query)
         self.logger.info("DELETE %s", len(self.query(query)))
+    
+    def truncate_table(self, stream, truncated_at, hard_truncate=False):
+        table = self.table_name(stream)
+
+        if hard_truncate:
+            query = "TRUNCATE {}".format(table)
+            self.logger.info("Truncating '%s' table for new version (%s)... %s", table, truncated_at, query)
+            self.query(query)
+        else:
+            query = "UPDATE {} SET _sdc_deleted_at = '{}' WHERE _sdc_deleted_at IS NULL RETURNING _sdc_deleted_at".format(table, truncated_at)
+            self.logger.info("Marking all previous version rows as deleted version for new version (%s) in '%s' table... %s", truncated_at, table, query)
+            self.logger.info("UPDATE %s", len(self.query(query)))
 
     def create_schema_if_not_exists(self, table_columns_cache=None):
         schema_name = self.schema_name
