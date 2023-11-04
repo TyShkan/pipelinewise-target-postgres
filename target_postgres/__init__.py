@@ -200,6 +200,7 @@ def persist_lines(config, lines) -> None:
 
                 # emit latest encountered state
                 emit_state(flushed_state)
+                emit_state(copy.deepcopy(flushed_state))
 
             # key_properties key must be available in the SCHEMA message.
             if 'key_properties' not in o:
@@ -268,6 +269,7 @@ def persist_lines(config, lines) -> None:
     if sum(row_count.values()) > 0:
         # flush all streams one last time, delete records if needed, reset counts and then emit current state
         flushed_state = flush_streams(records_to_load, row_count, stream_to_sync, config, state, flushed_state)
+        flushed_state = copy.deepcopy(state)
 
     # emit latest state
     emit_state(copy.deepcopy(flushed_state))
@@ -332,11 +334,10 @@ def flush_streams(
         ) for stream in streams_to_flush)
 
     # reset flushed stream records to empty to avoid flushing same records
-    for stream in streams_to_flush:
-        streams[stream] = {}
+    if filter_streams:
+        for stream in streams_to_flush:
+            streams[stream] = {}
 
-        # Update flushed streams
-        if filter_streams:
             # update flushed_state position if we have state information for the stream
             if state is not None and stream in state.get('bookmarks', {}):
                 # Create bookmark key if not exists
@@ -344,10 +345,9 @@ def flush_streams(
                     flushed_state['bookmarks'] = {}
                 # Copy the stream bookmark from the latest state
                 flushed_state['bookmarks'][stream] = copy.deepcopy(state['bookmarks'][stream])
-
+    else:
         # If we flush every bucket use the latest state
-        else:
-            flushed_state = copy.deepcopy(state)
+        flushed_state = copy.deepcopy(state)
 
     # Return with state message with flushed positions
     return flushed_state
