@@ -199,7 +199,6 @@ def persist_lines(config, lines) -> None:
                 flushed_state = flush_streams(records_to_load, row_count, stream_to_sync, config, state, flushed_state)
 
                 # emit latest encountered state
-                emit_state(flushed_state)
                 emit_state(copy.deepcopy(flushed_state))
 
             # key_properties key must be available in the SCHEMA message.
@@ -269,6 +268,7 @@ def persist_lines(config, lines) -> None:
     if sum(row_count.values()) > 0:
         # flush all streams one last time, delete records if needed, reset counts and then emit current state
         flushed_state = flush_streams(records_to_load, row_count, stream_to_sync, config, state, flushed_state)
+    else:
         flushed_state = copy.deepcopy(state)
 
     # emit latest state
