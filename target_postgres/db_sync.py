@@ -316,9 +316,9 @@ class DbSync:
                 )
 
                 if cur.rowcount > 0:
-                    return cur.fetchall()
+                    return cur.fetchall(), cur.rowcount
 
-                return []
+                return [], 0
 
     def table_name(self, stream_name, is_temporary=False, without_schema=False):
         stream_dict = stream_name_to_dict(stream_name)
@@ -382,9 +382,16 @@ class DbSync:
                 cur.execute(self.insert_from_temp_table(temp_table))
                 inserts = cur.rowcount
 
-                self.logger.info('Loading into %s: %s',
-                                 self.table_name(stream, False),
-                                 json.dumps({'inserts': inserts, 'updates': updates, 'size_bytes': size_bytes}))
+                stat = {
+                    'inserted': inserts,
+                    'updated': updates,
+                }
+                self.logger.info(
+                    'Loading into %s: %s',
+                    self.table_name(stream, False),
+                    json.dumps(stat)
+                )
+                return stat
 
     # pylint: disable=duplicate-string-formatting-argument
     def insert_from_temp_table(self, temp_table):
@@ -491,22 +498,37 @@ class DbSync:
                 self.create_index(stream, index)
 
     def delete_rows(self, stream):
+        stat = {"deleted": 0}
         table = self.table_name(stream)
-        query = "DELETE FROM {} WHERE _sdc_deleted_at IS NOT NULL RETURNING _sdc_deleted_at".format(table)
+
+        query = "DELETE FROM {} WHERE _sdc_deleted_at IS NOT NULL".format(table)
         self.logger.info("Deleting rows from '%s' table... %s", table, query)
-        self.logger.info("DELETE %s", len(self.query(query)))
-    
+        result, row_count = self.query(query)
+
+        self.logger.info("DELETE %s", row_count)
+        stat["deleted"] += row_count
+
+        return stat
+
     def truncate_table(self, stream, truncated_at, hard_truncate=False):
+        stat = {"truncated": 0, "updated": 0, "soft_deleted": 0}
         table = self.table_name(stream)
 
         if hard_truncate:
             query = "TRUNCATE {}".format(table)
             self.logger.info("Truncating '%s' table for new version (%s)... %s", table, truncated_at, query)
             self.query(query)
+            stat["truncated"] += 1
         else:
-            query = "UPDATE {} SET _sdc_deleted_at = '{}' WHERE _sdc_deleted_at IS NULL RETURNING _sdc_deleted_at".format(table, truncated_at)
+            query = "UPDATE {} SET _sdc_deleted_at = '{}' WHERE _sdc_deleted_at IS NULL".format(table, truncated_at)
             self.logger.info("Marking all previous version rows as deleted version for new version (%s) in '%s' table... %s", truncated_at, table, query)
-            self.logger.info("UPDATE %s", len(self.query(query)))
+            result, row_count = self.query(query)
+
+            self.logger.info("UPDATE %s", row_count)
+            stat["soft_deleted"] += row_count
+            stat["updated"] += row_count
+
+        return stat
 
     def create_schema_if_not_exists(self, table_columns_cache=None):
         schema_name = self.schema_name
@@ -517,7 +539,7 @@ class DbSync:
             schema_rows = list(filter(lambda x: x['TABLE_SCHEMA'] == schema_name, table_columns_cache))
         # Query realtime if not pre-collected
         else:
-            schema_rows = self.query(
+            schema_rows, row_count = self.query(
                 'SELECT LOWER(schema_name) schema_name FROM information_schema.schemata WHERE LOWER(schema_name) = %s',
                 (schema_name.lower(),)
             )
@@ -530,16 +552,22 @@ class DbSync:
             self.grant_privilege(schema_name, self.grantees, self.grant_usage_on_schema)
 
     def get_tables(self):
-        return self.query(
+        result, row_count = self.query(
             'SELECT table_name FROM information_schema.tables WHERE table_schema = %s',
             (self.schema_name,)
         )
+        return result
 
     def get_table_columns(self, table_name):
-        return self.query("""SELECT column_name, data_type
-      FROM information_schema.columns
-      WHERE lower(table_name) = %s AND lower(table_schema) = %s""", (table_name.replace("\"", "").lower(),
-                                                                     self.schema_name.lower()))
+        result, row_count = self.query(
+            """
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE lower(table_name) = %s AND lower(table_schema) = %s
+            """,
+            (table_name.replace("\"", "").lower(), self.schema_name.lower())
+        )
+        return result
 
     def update_columns(self):
         stream_schema_message = self.stream_schema_message

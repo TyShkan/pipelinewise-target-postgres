@@ -16,6 +16,7 @@ from jsonschema import Draft7Validator, FormatChecker
 from singer import get_logger
 
 from target_postgres.db_sync import DbSync
+from target_postgres.metrics import record_counter_dynamic
 
 LOGGER = get_logger('target_postgres')
 
@@ -321,17 +322,31 @@ def flush_streams(
         streams_to_flush = streams.keys()
 
     # Single-host, thread-based parallelism
-    with parallel_backend('threading', n_jobs=parallelism):
-        Parallel()(delayed(load_stream_batch)(
-            stream=stream,
-            records_to_load=streams[stream],
-            row_count=row_count,
-            db_sync=stream_to_sync[stream],
-            delete_rows=config.get('hard_delete'),
-            temp_dir=config.get('temp_dir'),
-            truncated=truncated,
-            truncate_table=config.get('hard_truncate')
-        ) for stream in streams_to_flush)
+    with record_counter_dynamic() as counter:
+        with parallel_backend('threading', n_jobs=parallelism):
+            streams_stat = Parallel()(delayed(load_stream_batch)(
+                stream=stream,
+                records_to_load=streams[stream],
+                row_count=row_count,
+                db_sync=stream_to_sync[stream],
+                delete_rows=config.get('hard_delete'),
+                temp_dir=config.get('temp_dir'),
+                truncated=truncated,
+                truncate_table=config.get('hard_truncate')
+            ) for stream in streams_to_flush)
+
+        for stream_stat in streams_stat:
+            for metric_type, amount in stream_stat["stat"].items():
+                if metric_type in {"inserted", "updated", "deleted"}:
+                    counter.increment(
+                        endpoint=stream_stat["stream"],
+                        amount=amount
+                    )
+                counter.increment(
+                    endpoint=stream_stat["stream"],
+                    metric_type=metric_type,
+                    amount=amount
+                )
 
     # reset flushed stream records to empty to avoid flushing same records
     if filter_streams:
@@ -358,21 +373,37 @@ def load_stream_batch(stream, records_to_load, row_count, db_sync, delete_rows=F
     """Load a batch of records and do post load operations, like creating
     or deleting rows"""
     # Load into Postgres
+
+    stat = {"stream": stream, "stat": {}}
+
     if row_count[stream] > 0:
-        flush_records(stream, records_to_load, row_count[stream], db_sync, temp_dir)
+        flush_stat = flush_records(stream, records_to_load, row_count[stream], db_sync, temp_dir)
+        stat["stat"].update(flush_stat)
 
     # Load finished, create indices if required
     db_sync.create_indices(stream)
 
     # Delete soft-deleted, flagged rows - where _sdc_deleted at is not null
     if delete_rows:
-        db_sync.delete_rows(stream)
-    
+        delete_stat = db_sync.delete_rows(stream)
+        for metric, value in delete_stat.items():
+            if metric not in stat["stat"]:
+                stat["stat"][metric] = 0
+
+            stat["stat"][metric] += value
+
     if truncated is not None:
-        db_sync.truncate_table(stream, truncated_at=truncated, hard_truncate=truncate_table)
+        truncate_stat = db_sync.truncate_table(stream, truncated_at=truncated, hard_truncate=truncate_table)
+        for metric, value in truncate_stat.items():
+            if metric not in stat["stat"]:
+                stat["stat"][metric] = 0
+
+            stat["stat"][metric] += value
 
     # reset row count for the current stream
     row_count[stream] = 0
+
+    return stat
 
 
 # pylint: disable=unused-argument
@@ -390,10 +421,12 @@ def flush_records(stream, records_to_load, row_count, db_sync, temp_dir=None):
             f.write(bytes(csv_line + '\n', 'UTF-8'))
 
     size_bytes = os.path.getsize(csv_file)
-    db_sync.load_csv(csv_file, row_count, size_bytes)
+    stat = db_sync.load_csv(csv_file, row_count, size_bytes)
 
     # Delete temp file
     os.remove(csv_file)
+
+    return stat
 
 
 def main():
