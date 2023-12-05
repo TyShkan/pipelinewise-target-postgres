@@ -97,172 +97,177 @@ def persist_lines(config, lines) -> None:
     total_row_count = {}
     batch_size_rows = config.get('batch_size_rows', DEFAULT_BATCH_SIZE_ROWS)
 
-    # Loop over lines from stdin
-    for line in lines:
-        try:
-            o = json.loads(line)
-        except json.decoder.JSONDecodeError:
-            LOGGER.error('Unable to parse:\n%s', line)
-            raise
+    with record_counter_dynamic() as counter:
+        # Loop over lines from stdin
+        for line in lines:
+            try:
+                o = json.loads(line)
+            except json.decoder.JSONDecodeError:
+                LOGGER.error('Unable to parse:\n%s', line)
+                raise
 
-        if 'type' not in o:
-            raise Exception("Line is missing required key 'type': {}".format(line))
-        t = o['type']
+            if 'type' not in o:
+                raise Exception("Line is missing required key 'type': {}".format(line))
+            t = o['type']
 
-        if t == 'RECORD':
-            if 'stream' not in o:
-                raise Exception("Line is missing required key 'stream': {}".format(line))
-            if o['stream'] not in schemas:
-                raise Exception(
-                    "A record for stream {} was encountered before a corresponding schema".format(o['stream']))
+            if t == 'RECORD':
+                if 'stream' not in o:
+                    raise Exception("Line is missing required key 'stream': {}".format(line))
+                if o['stream'] not in schemas:
+                    raise Exception(
+                        "A record for stream {} was encountered before a corresponding schema".format(o['stream']))
 
-            # Get schema for this record's stream
-            stream = o['stream']
+                # Get schema for this record's stream
+                stream = o['stream']
 
-            # Validate record
-            if config.get('validate_records'):
-                try:
-                    validators[stream].validate(float_to_decimal(o['record']))
-                except Exception as ex:
-                    if type(ex).__name__ == "InvalidOperation":
-                        raise InvalidValidationOperationException(
-                            f"Data validation failed and cannot load to destination. RECORD: {o['record']}\n"
-                            "multipleOf validations that allows long precisions are not supported (i.e. with 15 digits"
-                            "or more) Try removing 'multipleOf' methods from JSON schema.") from ex
-                    raise RecordValidationException(
-                        f"Record does not pass schema validation. RECORD: {o['record']}") from ex
+                # Validate record
+                if config.get('validate_records'):
+                    try:
+                        validators[stream].validate(float_to_decimal(o['record']))
+                    except Exception as ex:
+                        if type(ex).__name__ == "InvalidOperation":
+                            raise InvalidValidationOperationException(
+                                f"Data validation failed and cannot load to destination. RECORD: {o['record']}\n"
+                                "multipleOf validations that allows long precisions are not supported (i.e. with 15 digits"
+                                "or more) Try removing 'multipleOf' methods from JSON schema.") from ex
+                        raise RecordValidationException(
+                            f"Record does not pass schema validation. RECORD: {o['record']}") from ex
 
-            primary_key_string = stream_to_sync[stream].record_primary_key_string(o['record'])
-            if not primary_key_string:
-                primary_key_string = 'RID-{}'.format(total_row_count[stream])
+                primary_key_string = stream_to_sync[stream].record_primary_key_string(o['record'])
+                if not primary_key_string:
+                    primary_key_string = 'RID-{}'.format(total_row_count[stream])
 
-            if stream not in records_to_load:
-                records_to_load[stream] = {}
+                if stream not in records_to_load:
+                    records_to_load[stream] = {}
 
-            # increment row count only when a new PK is encountered in the current batch
-            if primary_key_string not in records_to_load[stream]:
-                row_count[stream] += 1
-                total_row_count[stream] += 1
+                # increment row count only when a new PK is encountered in the current batch
+                if primary_key_string not in records_to_load[stream]:
+                    row_count[stream] += 1
+                    total_row_count[stream] += 1
 
-            # append record
-            if config.get('add_metadata_columns') or config.get('hard_delete') or not config.get('hard_truncate'):
-                prepared_record = add_metadata_values_to_record(o)
+                counter.increment(
+                    endpoint=stream
+                )
 
-                if o.get('record', {}).get('_sdc_deleted_at') is not None:
-                    if primary_key_string in records_to_load[stream]:
-                        previous_record = records_to_load[stream][primary_key_string]
-                        previous_record.update(prepared_record)
-                        prepared_record = previous_record
+                # append record
+                if config.get('add_metadata_columns') or config.get('hard_delete') or not config.get('hard_truncate'):
+                    prepared_record = add_metadata_values_to_record(o)
 
-                records_to_load[stream][primary_key_string] = prepared_record
-            else:
-                records_to_load[stream][primary_key_string] = o['record']
+                    if o.get('record', {}).get('_sdc_deleted_at') is not None:
+                        if primary_key_string in records_to_load[stream]:
+                            previous_record = records_to_load[stream][primary_key_string]
+                            previous_record.update(prepared_record)
+                            prepared_record = previous_record
 
-            row_count[stream] = len(records_to_load[stream])
-
-            if row_count[stream] >= batch_size_rows:
-                # flush all streams, delete records if needed, reset counts and then emit current state
-                if config.get('flush_all_streams'):
-                    filter_streams = None
+                    records_to_load[stream][primary_key_string] = prepared_record
                 else:
-                    filter_streams = [stream]
+                    records_to_load[stream][primary_key_string] = o['record']
 
-                # Flush and return a new state dict with new positions only for the flushed streams
+                row_count[stream] = len(records_to_load[stream])
+
+                if row_count[stream] >= batch_size_rows:
+                    # flush all streams, delete records if needed, reset counts and then emit current state
+                    if config.get('flush_all_streams'):
+                        filter_streams = None
+                    else:
+                        filter_streams = [stream]
+
+                    # Flush and return a new state dict with new positions only for the flushed streams
+                    flushed_state = flush_streams(records_to_load,
+                                                row_count,
+                                                stream_to_sync,
+                                                config,
+                                                state,
+                                                flushed_state,
+                                                filter_streams=filter_streams)
+
+                    # emit last encountered state
+                    emit_state(copy.deepcopy(flushed_state))
+
+            elif t == 'STATE':
+                LOGGER.debug('Setting state to %s', o['value'])
+                state = o['value']
+
+                # Initially set flushed state
+                if not flushed_state:
+                    flushed_state = copy.deepcopy(state)
+
+            elif t == 'SCHEMA':
+                if 'stream' not in o:
+                    raise Exception("Line is missing required key 'stream': {}".format(line))
+                stream = o['stream']
+
+                schemas[stream] = float_to_decimal(o['schema'])
+                validators[stream] = Draft7Validator(schemas[stream], format_checker=FormatChecker())
+
+                # flush records from previous stream SCHEMA
+                if row_count.get(stream, 0) > 0:
+                    flushed_state = flush_streams(records_to_load, row_count, stream_to_sync, config, state, flushed_state)
+
+                    # emit latest encountered state
+                    emit_state(copy.deepcopy(flushed_state))
+
+                # key_properties key must be available in the SCHEMA message.
+                if 'key_properties' not in o:
+                    raise Exception("key_properties field is required")
+
+                # Log based and Incremental replications on tables with no Primary Key
+                # cause duplicates when merging UPDATE events.
+                # Stop loading data by default if no Primary Key.
+                #
+                # If you want to load tables with no Primary Key:
+                #  1) Set ` 'primary_key_required': false ` in the target-postgres config.json
+                #  or
+                #  2) Use fastsync [postgres-to-postgres, mysql-to-postgres, etc.]
+                if config.get('primary_key_required', True) and len(o['key_properties']) == 0:
+                    LOGGER.critical("Primary key is set to mandatory but not defined in the [%s] stream", stream)
+                    raise Exception("key_properties field is required")
+
+                key_properties[stream] = o['key_properties']
+
+                if config.get('add_metadata_columns') or config.get('hard_delete') or not config.get('hard_truncate'):
+                    stream_to_sync[stream] = DbSync(config, add_metadata_columns_to_schema(o))
+                else:
+                    stream_to_sync[stream] = DbSync(config, o)
+
+                stream_to_sync[stream].create_schema_if_not_exists()
+                stream_to_sync[stream].sync_table()
+
+                row_count[stream] = 0
+                total_row_count[stream] = 0
+
+            elif t == 'ACTIVATE_VERSION':
+                stream = o['stream']
+                version = o['version']
+
+                timestamp = datetime.fromtimestamp(version / 1000.0).astimezone(pytz.UTC).isoformat()
+
+                LOGGER.info('ACTIVATE_VERSION message RECEIVED for stream %s version %s timestamp %s', stream, version, timestamp)
+
+                # Initially set flushed state
+                if not flushed_state:
+                    flushed_state = copy.deepcopy(state)
+
+                filter_streams = [stream]
+
+                if stream not in records_to_load:
+                    records_to_load[stream] = {}
+
                 flushed_state = flush_streams(records_to_load,
-                                              row_count,
-                                              stream_to_sync,
-                                              config,
-                                              state,
-                                              flushed_state,
-                                              filter_streams=filter_streams)
+                                                row_count,
+                                                stream_to_sync,
+                                                config,
+                                                state,
+                                                flushed_state,
+                                                filter_streams=filter_streams,
+                                                truncated=timestamp)
 
                 # emit last encountered state
                 emit_state(copy.deepcopy(flushed_state))
 
-        elif t == 'STATE':
-            LOGGER.debug('Setting state to %s', o['value'])
-            state = o['value']
-
-            # Initially set flushed state
-            if not flushed_state:
-                flushed_state = copy.deepcopy(state)
-
-        elif t == 'SCHEMA':
-            if 'stream' not in o:
-                raise Exception("Line is missing required key 'stream': {}".format(line))
-            stream = o['stream']
-
-            schemas[stream] = float_to_decimal(o['schema'])
-            validators[stream] = Draft7Validator(schemas[stream], format_checker=FormatChecker())
-
-            # flush records from previous stream SCHEMA
-            if row_count.get(stream, 0) > 0:
-                flushed_state = flush_streams(records_to_load, row_count, stream_to_sync, config, state, flushed_state)
-
-                # emit latest encountered state
-                emit_state(copy.deepcopy(flushed_state))
-
-            # key_properties key must be available in the SCHEMA message.
-            if 'key_properties' not in o:
-                raise Exception("key_properties field is required")
-
-            # Log based and Incremental replications on tables with no Primary Key
-            # cause duplicates when merging UPDATE events.
-            # Stop loading data by default if no Primary Key.
-            #
-            # If you want to load tables with no Primary Key:
-            #  1) Set ` 'primary_key_required': false ` in the target-postgres config.json
-            #  or
-            #  2) Use fastsync [postgres-to-postgres, mysql-to-postgres, etc.]
-            if config.get('primary_key_required', True) and len(o['key_properties']) == 0:
-                LOGGER.critical("Primary key is set to mandatory but not defined in the [%s] stream", stream)
-                raise Exception("key_properties field is required")
-
-            key_properties[stream] = o['key_properties']
-
-            if config.get('add_metadata_columns') or config.get('hard_delete') or not config.get('hard_truncate'):
-                stream_to_sync[stream] = DbSync(config, add_metadata_columns_to_schema(o))
             else:
-                stream_to_sync[stream] = DbSync(config, o)
-
-            stream_to_sync[stream].create_schema_if_not_exists()
-            stream_to_sync[stream].sync_table()
-
-            row_count[stream] = 0
-            total_row_count[stream] = 0
-
-        elif t == 'ACTIVATE_VERSION':
-            stream = o['stream']
-            version = o['version']
-
-            timestamp = datetime.fromtimestamp(version / 1000.0).astimezone(pytz.UTC).isoformat()
-
-            LOGGER.info('ACTIVATE_VERSION message RECEIVED for stream %s version %s timestamp %s', stream, version, timestamp)
-
-            # Initially set flushed state
-            if not flushed_state:
-                flushed_state = copy.deepcopy(state)
-
-            filter_streams = [stream]
-
-            if stream not in records_to_load:
-                records_to_load[stream] = {}
-
-            flushed_state = flush_streams(records_to_load,
-                                            row_count,
-                                            stream_to_sync,
-                                            config,
-                                            state,
-                                            flushed_state,
-                                            filter_streams=filter_streams,
-                                            truncated=timestamp)
-
-            # emit last encountered state
-            emit_state(copy.deepcopy(flushed_state))
-
-        else:
-            raise Exception("Unknown message type {} in message {}"
-                            .format(o['type'], o))
+                raise Exception("Unknown message type {} in message {}"
+                                .format(o['type'], o))
 
     # if some bucket has records that need to be flushed but haven't reached batch size
     # then flush all buckets.
@@ -337,11 +342,6 @@ def flush_streams(
 
         for stream_stat in streams_stat:
             for metric_type, amount in stream_stat["stat"].items():
-                if metric_type in {"inserted", "updated", "deleted"}:
-                    counter.increment(
-                        endpoint=stream_stat["stream"],
-                        amount=amount
-                    )
                 counter.increment(
                     endpoint=stream_stat["stream"],
                     metric_type=metric_type,
