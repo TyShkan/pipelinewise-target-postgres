@@ -342,11 +342,12 @@ def flush_streams(
 
         for stream_stat in streams_stat:
             for metric_type, amount in stream_stat["stat"].items():
-                counter.increment(
-                    endpoint=stream_stat["stream"],
-                    metric_type=metric_type,
-                    amount=amount
-                )
+                if amount > 0:
+                    counter.increment(
+                        endpoint=stream_stat["stream"],
+                        metric_type=metric_type,
+                        amount=amount
+                    )
 
     # reset flushed stream records to empty to avoid flushing same records
     if filter_streams:

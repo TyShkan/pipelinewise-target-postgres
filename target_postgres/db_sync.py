@@ -10,6 +10,8 @@ import time
 from collections.abc import MutableMapping
 from singer import get_logger
 
+SNAKE_CASE_VAR_NAME_RE = re.compile(r"((?<=[a-z0-9])[A-Z]|(?!^)(?<!_)[A-Z](?=[a-z]))")
+PYTHON_VAR_NAME_RE = re.compile(r"\W|^(?=\d)")
 
 # pylint: disable=missing-function-docstring,missing-class-docstring
 def validate_config(config):
@@ -320,10 +322,19 @@ class DbSync:
 
                 return [], 0
 
+    def get_cleaned_python_var_name(self, name: str) -> str:
+        return PYTHON_VAR_NAME_RE.sub("_", name)
+
+    def get_snake_case_var_name(self, name: str) -> str:
+        return SNAKE_CASE_VAR_NAME_RE.sub(r"_\1", name).lower()
+
+    def get_clean_name(self, name: str) -> str:
+        return self.get_snake_case_var_name(self.get_cleaned_python_var_name(name))
+
     def table_name(self, stream_name, is_temporary=False, without_schema=False):
         stream_dict = stream_name_to_dict(stream_name)
         table_name = stream_dict['table_name']
-        pg_table_name = table_name.replace('.', '_').replace('-', '_').lower()
+        pg_table_name = self.get_clean_name(table_name)
 
         if is_temporary:
             return 'tmp_{}'.format(str(uuid.uuid4()).replace('-', '_'))
