@@ -318,7 +318,12 @@ class DbSync:
                 )
 
                 if cur.rowcount > 0:
-                    return cur.fetchall(), cur.rowcount
+                    if cur.description is not None:
+                        result = cur.fetchall()
+                    else:
+                        result = []
+
+                    return result, cur.rowcount
 
                 return [], 0
 
