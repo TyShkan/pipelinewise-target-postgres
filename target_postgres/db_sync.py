@@ -226,11 +226,25 @@ class DbSync:
             # Define initial list of indices to created
             self.hard_delete = self.connection_config.get('hard_delete')
             self.hard_truncate = self.connection_config.get('hard_truncate')
+            self.enforce_deleted_at_index = self.connection_config.get('enforce_deleted_at_index')
+            self.enforce_updated_at_index = self.connection_config.get('enforce_updated_at_index')
+            self.enforce_batched_at_index = self.connection_config.get('enforce_batched_at_index')
+            self.enforce_extracted_at_index = self.connection_config.get('enforce_extracted_at_index')
 
-            if self.hard_delete or not self.hard_truncate:
-                self.indices = ['_sdc_deleted_at']
-            else:
-                self.indices = []
+            self.indices = []
+
+            if self.hard_delete or not self.hard_truncate or self.enforce_deleted_at_index:
+                if '_sdc_deleted_at' in self.stream_schema_message.get('schema', {}).get('properties', {}):
+                    self.indices.append('_sdc_deleted_at')
+
+            if self.enforce_updated_at_index and '_sdc_updated_at' in self.stream_schema_message.get('schema', {}).get('properties', {}):
+                self.indices.append('_sdc_updated_at')
+
+            if self.enforce_batched_at_index and '_sdc_batched_at' in self.stream_schema_message.get('schema', {}).get('properties', {}):
+                self.indices.append('_sdc_batched_at')
+
+            if self.enforce_extracted_at_index and '_sdc_extracted_at' in self.stream_schema_message.get('schema', {}).get('properties', {}):
+                self.indices.append('_sdc_extracted_at')
 
             #  Define target schema name.
             #  --------------------------
