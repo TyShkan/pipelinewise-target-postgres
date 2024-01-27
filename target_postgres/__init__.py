@@ -56,7 +56,10 @@ def add_metadata_columns_to_schema(schema_message):
                                                                             'format': 'date-time'}
     extended_schema_message['schema']['properties']['_sdc_batched_at'] = {'type': ['null', 'string'],
                                                                           'format': 'date-time'}
-    extended_schema_message['schema']['properties']['_sdc_deleted_at'] = {'type': ['null', 'string']}
+    extended_schema_message['schema']['properties']['_sdc_deleted_at'] = {'type': ['null', 'string'],
+                                                                          'format': 'date-time'}
+    extended_schema_message['schema']['properties']['_sdc_updated_at'] = {'type': ['null', 'string'],
+                                                                          'format': 'date-time'}
 
     return extended_schema_message
 
@@ -69,6 +72,10 @@ def add_metadata_values_to_record(record_message):
     extended_record['_sdc_extracted_at'] = record_message.get('time_extracted')
     extended_record['_sdc_batched_at'] = datetime.utcnow().isoformat()
     extended_record['_sdc_deleted_at'] = record_message.get('record', {}).get('_sdc_deleted_at')
+
+    sdc_updated_at = record_message.get('record', {}).get('_sdc_updated_at')
+    if sdc_updated_at:
+        extended_record['_sdc_updated_at'] = sdc_updated_at
 
     return extended_record
 
