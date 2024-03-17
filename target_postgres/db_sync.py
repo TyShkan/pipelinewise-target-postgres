@@ -308,38 +308,74 @@ class DbSync:
             self.flatten_schema = flatten_schema(stream_schema_message['schema'],
                                                  max_level=self.data_flattening_max_level)
 
+    def get_namespace(self, conn_config):
+        if conn_config.get('add_user_to_namespace'):
+            namespace = f"{conn_config['namespace']}_{conn_config['user']}"
+        else:
+            namespace = conn_config['namespace']
+
+        return namespace
+
     def open_connection(self):
-        conn_string = "host='{}' dbname='{}' user='{}' password='{}' port='{}'".format(
-            self.connection_config['host'],
-            self.connection_config['dbname'],
-            self.connection_config['user'],
-            self.connection_config['password'],
-            self.connection_config['port']
-        )
+        namespace = self.get_namespace(self.connection_config)
 
-        if 'ssl' in self.connection_config and self.connection_config['ssl'] == 'true':
-            conn_string += " sslmode='require'"
+        cfg = {
+            'application_name': namespace,
+            'host': self.connection_config['host'],
+            'dbname': self.connection_config['dbname'],
+            'user': self.connection_config['user'],
+            'password': self.connection_config['password'],
+            'port': self.connection_config['port'],
+            'connect_timeout': self.connection_config.get('connect_timeout', 30),
+        }
 
-        return psycopg2.connect(conn_string)
+        if self.connection_config.get('sslmode'):
+            cfg['sslmode'] = self.connection_config.get('sslmode', 'require')
+
+        retries = self.connection_config.get('connect_retries', 1)
+        retry_sleep = self.connection_config.get('connect_retry_sleep', 3)
+
+        for retry in range(retries):
+            try:
+                return psycopg2.connect(**cfg)
+            except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
+                self.logger.warning(f"Can't connect to DB [{retry+1} attempt]: {e}")
+
+                if retry == retries - 1:
+                    raise e
+
+                sleep_sec = retry_sleep ** (retry + 1)
+
+                self.logger.info(f"Sleep for {sleep_sec} sec...")
+                time.sleep(sleep_sec)
 
     def query(self, query, params=None):
         self.logger.debug("Running query: %s", query)
-        with self.open_connection() as connection:
-            with connection.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute(
-                    query,
-                    params
-                )
 
-                if cur.rowcount > 0:
-                    if cur.description is not None:
-                        result = cur.fetchall()
-                    else:
-                        result = []
+        connection = self.open_connection()
 
-                    return result, cur.rowcount
+        cur_rowcount = 0
 
-                return [], 0
+        with connection.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                query,
+                params
+            )
+
+            cur_rowcount = cur.rowcount
+
+            if cur_rowcount > 0:
+                if cur.description is not None:
+                    result = cur.fetchall()
+                else:
+                    result = []
+
+        connection.close()
+
+        if cur_rowcount > 0:
+            return result, cur_rowcount
+
+        return [], 0
 
     def get_cleaned_python_var_name(self, name: str) -> str:
         return PYTHON_VAR_NAME_RE.sub("_", name)
@@ -391,37 +427,42 @@ class DbSync:
         stream = stream_schema_message['stream']
         self.logger.info("Loading %d rows into '%s'", count, self.table_name(stream, False))
 
-        with self.open_connection() as connection:
-            with connection.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                inserts = 0
-                updates = 0
+        connection = self.open_connection()
 
-                temp_table = self.table_name(stream_schema_message['stream'], is_temporary=True)
-                cur.execute(self.create_table_query(table_name=temp_table, is_temporary=True))
+        stat = {
+            'inserted': 0,
+            'updated': 0,
+        }
 
-                copy_sql = "COPY {} ({}) FROM STDIN WITH (FORMAT CSV, ESCAPE '\\')".format(
-                    temp_table,
-                    ', '.join(self.column_names())
-                )
-                self.logger.debug(copy_sql)
-                with open(file, "rb") as f:
-                    cur.copy_expert(copy_sql, f)
-                if len(self.stream_schema_message['key_properties']) > 0:
-                    cur.execute(self.update_from_temp_table(temp_table))
-                    updates = cur.rowcount
-                cur.execute(self.insert_from_temp_table(temp_table))
-                inserts = cur.rowcount
+        with connection.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            temp_table = self.table_name(stream_schema_message['stream'], is_temporary=True)
+            cur.execute(self.create_table_query(table_name=temp_table, is_temporary=True))
 
-                stat = {
-                    'inserted': inserts,
-                    'updated': updates,
-                }
-                self.logger.info(
-                    'Loading into %s: %s',
-                    self.table_name(stream, False),
-                    json.dumps(stat)
-                )
-                return stat
+            copy_sql = "COPY {} ({}) FROM STDIN WITH (FORMAT CSV, ESCAPE '\\')".format(
+                temp_table,
+                ', '.join(self.column_names())
+            )
+            self.logger.debug(copy_sql)
+
+            with open(file, "rb") as f:
+                cur.copy_expert(copy_sql, f)
+
+            if len(self.stream_schema_message['key_properties']) > 0:
+                cur.execute(self.update_from_temp_table(temp_table))
+                stat['updated'] = cur.rowcount
+
+            cur.execute(self.insert_from_temp_table(temp_table))
+            stat['inserted'] = cur.rowcount
+
+            self.logger.info(
+                'Loading into %s: %s',
+                self.table_name(stream, False),
+                json.dumps(stat)
+            )
+
+        connection.close()
+
+        return stat
 
     # pylint: disable=duplicate-string-formatting-argument
     def insert_from_temp_table(self, temp_table):
