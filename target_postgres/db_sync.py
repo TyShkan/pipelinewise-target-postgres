@@ -354,6 +354,7 @@ class DbSync:
 
         connection = self.open_connection()
 
+        result = None
         cur_rowcount = 0
 
         with connection.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -370,6 +371,7 @@ class DbSync:
                 else:
                     result = []
 
+        connection.commit()
         connection.close()
 
         if cur_rowcount > 0:
@@ -460,6 +462,7 @@ class DbSync:
                 json.dumps(stat)
             )
 
+        connection.commit()
         connection.close()
 
         return stat
@@ -675,7 +678,7 @@ class DbSync:
 
     def drop_column(self, column_name, stream):
         drop_column = "ALTER TABLE {} DROP COLUMN {}".format(self.table_name(stream), column_name)
-        self.logger.info('Dropping column: %s', drop_column)
+        self.logger.warning('Dropping column: %s', drop_column)
         self.query(drop_column)
 
     def version_column(self, column_name, stream):
@@ -688,7 +691,7 @@ class DbSync:
 
     def add_column(self, column, stream):
         add_column = "ALTER TABLE {} ADD COLUMN {}".format(self.table_name(stream), column)
-        self.logger.info('Adding column: %s', add_column)
+        self.logger.warning('Adding column: %s', add_column)
         self.query(add_column)
 
     def sync_table(self):
