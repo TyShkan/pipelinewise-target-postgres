@@ -77,7 +77,7 @@ class TestUnit(unittest.TestCase):
         self.assertEqual(mapper(json_dt_or_null)   , 'timestamp without time zone')
         self.assertEqual(mapper(json_t)            , 'time without time zone')
         self.assertEqual(mapper(json_t_or_null)    , 'time without time zone')
-        self.assertEqual(mapper(json_num)          , 'double precision')
+        self.assertEqual(mapper(json_num)          , 'numeric')
         self.assertEqual(mapper(json_smallint)     , 'smallint')
         self.assertEqual(mapper(json_int)          , 'integer')
         self.assertEqual(mapper(json_bigint)       , 'bigint')
