@@ -7,6 +7,7 @@ import re
 import uuid
 import itertools
 import time
+import hashlib
 from collections.abc import MutableMapping
 from singer import get_logger
 
@@ -559,9 +560,13 @@ class DbSync:
 
     def create_index(self, stream, column):
         table = self.table_name(stream)
-        table_without_schema = self.table_name(stream, without_schema=True)
-        index_name = 'i_{}_{}'.format(table_without_schema[:30].replace(' ', '').replace('"', ''),
-                                      column.replace(',', '_'))
+
+        index_string = "{}_{}".format(table, column)
+        index_name = 'i_{}'.format(hashlib.md5(
+            index_string.encode("utf-8"),
+            usedforsecurity=False
+        ).hexdigest())
+
         query = "CREATE INDEX IF NOT EXISTS {} ON {} ({})".format(index_name, table, column)
         self.logger.info("Creating index on '%s' table on '%s' column(s)... %s", table, column, query)
         self.query(query)
